@@ -15,8 +15,6 @@ structure Config where
   file_path : System.FilePath := "."
   const_name : Lean.Name := `Unknown
   print_infotree : Bool := false
-  print_stage1 : Bool := false
-  print_stage2 : Bool := false
   min_match_len : Nat := 2
   nonmatchers : String := ""
 
@@ -31,10 +29,6 @@ def parseArgs (args : Array String) : IO Config := do
     match args[idx]! with
     | "--print-infotree" =>
        cfg := {cfg with print_infotree := true}
-    | "--print-stage1" =>
-       cfg := {cfg with print_stage1 := true}
-    | "--print-stage2" =>
-       cfg := {cfg with print_stage2 := true}
     | "--min-match-len" =>
        idx := idx + 1
        let x := args[idx]!.toNat!
@@ -57,43 +51,6 @@ structure Goal where
   goalId : String
   state : String
 deriving Lean.ToJson, Lean.FromJson, BEq
-
-structure TransformedGoal where
-  goal : Goal
-  indexMaps : IndexMaps
-deriving Lean.ToJson, Lean.FromJson
-
-structure GoalAction where
-  --- MVarId from before the tactic is applied.
-  startGoalId : String
-
-  --- Pretty-printed goal state before the tactic is applied.
-  startState : String
-
-  -- empty means the goal has been closed.
-  results : List TransformedGoal
-deriving Lean.ToJson, Lean.FromJson
-
---- Application of a single tactic.
---- It may act on multiple goals (e.g. when using the <;> combinator).
-structure Action where
-  tacticText : String
-  goalActions : List GoalAction
-deriving Lean.ToJson, Lean.FromJson
-
-structure GoalHighlighting where
-  goalId : String
-  colors : HighlightSyntax.ColorMap
-deriving Lean.ToJson, Lean.FromJson
-
--- Result of stage 3.
--- To be jsonified and consumed by animate.py in Blender
-structure Movie where
-  theoremName : String
-  startGoal : Goal
-  actions: List Action
-  highlighting: Array GoalHighlighting
-deriving Lean.ToJson, Lean.FromJson
 
 ------------------
 
@@ -144,34 +101,6 @@ def TacticStep.goals_before : TacticStep →  List Goal
 | .node data _ => data.goals_before
 | .seq _ [] => []
 | .seq _ (c::_) => c.goals_before
-
---------------------
--- stage 2: flattened map of tactic steps.
-
-structure TacticStep' where
-  text : String
-  span : StringSpan
-  goal_before : Goal
-  goals_after : List Goal -- include children
-  reverse_s1 : Bool := false
-  reverse_s2 : Bool := false
-deriving Lean.ToJson, Lean.FromJson
-
-/-- map from goalId to tactic step that consumes that goal.
-    That should be the latest, most specific step
-    that lists the goal in its before state but not in its after state.
--/
-abbrev StepMap := Std.HashMap String TacticStep'
-
-structure Stage2State where
-  startGoal : Goal
-  steps : StepMap
-
-def Stage2State.dump (s : Stage2State) : IO Unit := do
-  IO.println <| "stage2 with top goal " ++ s.startGoal.goalId
-  for ⟨_, ts⟩ in s.steps.toList do
-    IO.println <| s!"{Lean.ToJson.toJson ts}"
-  -- TODO
 
 section syntax_manip
 
@@ -409,88 +338,6 @@ unsafe def extractToplevelStep (tree : InfoTree) : IO TacticStep := do
   let [step] := steps | throw <| IO.userError "got more than one toplevel step"
   return step
 
-partial def stage2_aux (step : TacticStep) : StateM StepMap Unit := match step with
-| .node data children => do
-  if let [goal] := data.goals_before then
-    let sm ← get
-    let goalId := goal.goalId
-    let span := data.tacticSpan
-    -- goals after includes stuff from the children in addition to data.goals_after.
-    let mut goals_after := []
-    for child in children do
-      for g in child.goals_before do
-        goals_after := g :: goals_after
-    for g in data.goals_after do
-       goals_after := g :: goals_after
-    let ts' := { span,
-                 goal_before := goal,
-                 goals_after := goals_after.reverse,
-                 text := data.text,
-                 reverse_s1 := data.reverse_s1
-                 reverse_s2 := data.reverse_s2 }
-    set (sm.insert goalId ts')
-  for child in children do
-    stage2_aux child
-| .seq _ children => do
-  for child in children do
-    stage2_aux child
-
-partial def stage2 (step : TacticStep) : IO Stage2State := do
-  let ⟨_, m⟩ := StateT.run (stage2_aux step) default
-  let [top_goal] := step.goals_before |
-         throw <| IO.userError "got more than one toplevel step"
-  return { startGoal := top_goal, steps := m }
-
-
-def stage3_inner (config : Config) (step : TacticStep') : GoalAction := Id.run do
-    let mut ts_rev : List TransformedGoal := []
-    for g in step.goals_after do
-      let im := Animate.do_match step.goal_before.state g.state
-                                 (min_match_len := config.min_match_len)
-                                 (nonmatchers := config.nonmatchers)
-                                 (s1_reverse_order := step.reverse_s1)
-                                 (s2_reverse_order := step.reverse_s2)
-      ts_rev := {goal := g, indexMaps := im} :: ts_rev
-    let ga : GoalAction := {
-      startGoalId := step.goal_before.goalId
-      startState := step.goal_before.state
-      results := ts_rev.reverse
-    }
-    return ga
-
-partial def stage3 (config : Config) (state2 : Stage2State) : IO Movie := do
-  let mut rev_actions := []
-  let mut visited := Batteries.mkRBSet String Ord.compare
-  let mut colorings := #[]
-  let mut currentGoals := [state2.startGoal.goalId]
-  while currentGoals.length > 0 do
-    let currentGoal :: rest := currentGoals | panic "impossible"
-    if visited.contains currentGoal then panic s!"re-visited goal {currentGoal}"
-    visited := visited.insert currentGoal
-    let .some step :=
-      state2.steps.get? currentGoal | panic s!"goal not found {currentGoal}"
-    colorings := colorings.push ⟨currentGoal, ← HighlightSyntax.assign_colors step.goal_before.state⟩
-    let mut goal_actions := [stage3_inner config step]
-    currentGoals := []
-    for gid in rest do
-      let .some other_step :=
-        state2.steps.get? gid | panic s!"goal not found {gid}"
-      if other_step.span == step.span
-      then
-        colorings := colorings.push ⟨gid, ← HighlightSyntax.assign_colors other_step.goal_before.state⟩
-        goal_actions := stage3_inner config other_step :: goal_actions
-        currentGoals := currentGoals ++ (other_step.goals_after.map (·.goalId))
-      else
-        currentGoals := currentGoals ++ [gid]
-
-    rev_actions := { tacticText := step.text, goalActions := goal_actions } :: rev_actions
-    currentGoals := (step.goals_after.map (·.goalId)) ++ currentGoals
-    pure ()
-  -- TODO: verify that everything in state2 was visited.
-  return { theoremName := config.const_name.toString
-           actions := rev_actions.reverse
-           startGoal := state2.startGoal,
-           highlighting := colorings}
 
 unsafe def processCommands : Frontend.FrontendM (List (Environment × InfoState)) := do
   let done ← Lean.Elab.Frontend.processCommand
@@ -536,14 +383,7 @@ unsafe def processFile (config : Config) : IO Unit := do
         if config.print_infotree then
            IO.println (Format.pretty (←tree.format))
         let step ← extractToplevelStep tree
-        if config.print_stage1 then
-          IO.println s!"{ToJson.toJson step}"
-        let stage2state ← stage2 step
-        if config.print_stage2 then
-          IO.println "STAGE 2:"
-          stage2state.dump
-        let stage3 ← stage3 config stage2state
-        IO.println <| (Lean.toJson stage3).pretty (lineWidth := 200)
+        IO.println ((Lean.toJson step).pretty (lineWidth := 200))
       -- we're done
       return ()
 
