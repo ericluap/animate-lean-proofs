@@ -320,6 +320,9 @@ unsafe def visitTacticInfo (ci : ContextInfo) (ti : TacticInfo)
     -- induction alternative. We want the direct children
     -- of `induction` to be `seq` nodes, so we collapse these.
     return acc
+  | ``Lean.cdot =>
+    -- who cares about bullet points...
+    return acc
   | _ => pure ()
 
   let mut inners := []
