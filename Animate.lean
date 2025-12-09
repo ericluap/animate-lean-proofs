@@ -102,6 +102,16 @@ def TacticStep.goals_before : TacticStep →  List Goal
 | .seq _ [] => []
 | .seq _ (c::_) => c.goals_before
 
+structure ProofGoal where
+  hypotheses : List String
+  goal : String
+deriving Lean.ToJson, Lean.FromJson
+
+inductive ProofStep where
+| node (proof_state : List ProofGoal) (next_tactic : String) (children : List ProofStep)
+| empty
+deriving Lean.ToJson, Lean.FromJson
+
 section syntax_manip
 
 open Lean
@@ -338,6 +348,35 @@ unsafe def extractToplevelStep (tree : InfoTree) : IO TacticStep := do
   let [step] := steps | throw <| IO.userError "got more than one toplevel step"
   return step
 
+unsafe def cleanup_goal (state : Goal) : ProofGoal :=
+  match state.state.splitToList (fun c => c == '⊢') with
+  | [hypotheses, goal] =>
+    let hypotheses := hypotheses.trim.splitToList (fun c => c == '\n')
+    ProofGoal.mk hypotheses goal.trim
+  | _ => ProofGoal.mk ["oops"] "oops!"
+
+unsafe def cleanup_step (step : TacticStep) : ProofStep :=
+  match step with
+  | .node info children =>
+    if info.name != "choice" then
+      let state := info.goals_before.map cleanup_goal
+      let next_tactic := info.text
+      let children := children.map cleanup_step
+      ProofStep.node state next_tactic children
+    else
+      -- at a glance, it seems like `choice` is followed by the actual tactic.
+      -- No clue what a choice is, though. :)
+      List.headD (children.map cleanup_step) ProofStep.empty
+  | .seq _ xs =>
+    xs.foldr (fun tStep prev =>
+      match cleanup_step tStep with
+      | .empty => .empty
+      | .node state next_tactic children =>
+        let newChildren := (match prev with
+          | .empty => children
+          | c => c :: children)
+        ProofStep.node state next_tactic newChildren)
+      .empty
 
 unsafe def processCommands : Frontend.FrontendM (List (Environment × InfoState)) := do
   let done ← Lean.Elab.Frontend.processCommand
@@ -383,7 +422,8 @@ unsafe def processFile (config : Config) : IO Unit := do
         if config.print_infotree then
            IO.println (Format.pretty (←tree.format))
         let step ← extractToplevelStep tree
-        IO.println ((Lean.toJson step).pretty (lineWidth := 200))
+        let cleaned_up := cleanup_step step
+        IO.println ((Lean.toJson cleaned_up).pretty (lineWidth := 200))
       -- we're done
       return ()
 
