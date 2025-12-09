@@ -90,7 +90,7 @@ def assign_colors (s : String) : IO ColorMap := do
   IO.FS.writeFile filename s
   let child ← IO.Process.spawn {
     cmd := "pygmentize"
-    args := #["-l", "lean4", "-f", "raw", filename]
+    args := #["-l", "lean", "-f", "raw", filename]
     stdout := .piped
   }
 

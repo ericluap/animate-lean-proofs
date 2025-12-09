@@ -27,4 +27,7 @@ lean_exe «Animate» where
   -- Remove this line if you do not need such functionality.
   supportInterpreter := true
 
+lean_exe «transform_format_wrapper» where
+  root := `transform_format_wapper
+
 require mathlib from git "https://github.com/leanprover-community/mathlib4" @ "v4.25.0"
